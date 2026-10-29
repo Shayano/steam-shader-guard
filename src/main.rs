@@ -126,6 +126,7 @@ struct Paths {
     home: PathBuf,
     data: PathBuf,
     state: PathBuf,
+    config: PathBuf,
     bin: PathBuf,
 }
 impl Paths {
@@ -155,6 +156,7 @@ impl Paths {
         Ok(Self {
             data: xdg("XDG_DATA_HOME", home.join(".local/share"))?.join("steam-shader-guard"),
             state: xdg("XDG_STATE_HOME", home.join(".local/state"))?.join("steam-shader-guard"),
+            config: xdg("XDG_CONFIG_HOME", home.join(".config"))?,
             bin: home.join(".local/bin/steam-shader-guard"),
             home,
         })
@@ -360,6 +362,7 @@ fn entry() -> Result<()> {
             ));
             Ok(())
         }
+        cli::Command::Status(args) => steam::status(&paths, &args.id, args.json),
         cli::Command::Install { apply } => steam::install(&paths, apply),
         cli::Command::Enable(args) => steam::enable(&paths, &args),
         cli::Command::Disable { id, apply } => steam::disable(&paths, Some(&id), apply, false),

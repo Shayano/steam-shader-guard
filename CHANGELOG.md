@@ -1,5 +1,13 @@
 # Changelog
 
+## Unreleased
+
+- Add `status GAME_ID`: a read-only view of a game's cache folders per NVIDIA
+  driver, the game's own entries, copied shaders and space used by older drivers.
+- `doctor` reports login autostart entries that start Steam without Shader Guard.
+- The game launcher sets `__GL_SHADER_DISK_CACHE_SKIP_CLEANUP=1` unless already
+  set, instead of relying on Steam's launch environment.
+
 ## 0.2.0 (2026-10-06)
 
 - Install or update with a curl command on x86-64 Linux. The installer checks the

@@ -9,7 +9,8 @@ fn command(home: &Path) -> Command {
     let mut c = Command::new(BIN);
     c.env("SHADER_GUARD_HOME", home)
         .env("XDG_DATA_HOME", home.join(".local/share"))
-        .env("XDG_STATE_HOME", home.join(".local/state"));
+        .env("XDG_STATE_HOME", home.join(".local/state"))
+        .env("XDG_CONFIG_HOME", home.join(".config"));
     c
 }
 fn run(home: &Path, args: &[&str]) -> Output {
@@ -85,6 +86,108 @@ fn explicit_json_reports_have_no_progress_on_stdout_or_side_effects() {
     assert!(messages.contains("Check finished. No files changed."));
     assert!(!home.join(".local/state/steam-shader-guard").exists());
     assert!(!home.join(".local/share/steam-shader-guard").exists());
+}
+
+#[test]
+fn doctor_warns_when_steam_autostarts_without_shader_guard() {
+    let t = tempfile::tempdir().unwrap();
+    let home = t.path().join("home");
+    setup(&home);
+    let autostart = home.join(".config/autostart");
+    fs::create_dir_all(&autostart).unwrap();
+    let doctor = run(&home, &["doctor"]);
+    assert!(
+        !String::from_utf8(doctor.stdout)
+            .unwrap()
+            .contains("starts automatically")
+    );
+
+    fs::write(
+        autostart.join("steam.desktop"),
+        "[Desktop Entry]\nName=Steam\nExec=/usr/bin/steam %U\n\n[Desktop Action Store]\nExec=/usr/bin/steam steam://store\n",
+    )
+    .unwrap();
+    fs::write(
+        autostart.join("guarded.desktop"),
+        "[Desktop Entry]\nExec=\"/home/x/.local/bin/steam-shader-guard\" steam %U\n",
+    )
+    .unwrap();
+    fs::write(
+        autostart.join("disabled.desktop"),
+        "[Desktop Entry]\nExec=steam -silent\nHidden=true\n",
+    )
+    .unwrap();
+    let text = String::from_utf8(run(&home, &["doctor"]).stdout).unwrap();
+    assert_eq!(text.matches("starts automatically").count(), 1);
+    assert!(text.contains("steam.desktop, without Shader Guard"));
+    assert!(text.contains("steam-shader-guard\" steam %U"));
+    let report: serde_json::Value =
+        serde_json::from_slice(&run(&home, &["doctor", "--json"]).stdout).unwrap();
+    let listed = report["steam_autostart_without_shader_guard"]
+        .as_array()
+        .unwrap();
+    assert_eq!(listed.len(), 1);
+    assert!(
+        listed[0]
+            .as_str()
+            .unwrap()
+            .ends_with("autostart/steam.desktop")
+    );
+}
+
+#[test]
+fn status_reports_driver_folders_and_unused_copies_without_changes() {
+    let t = tempfile::tempdir().unwrap();
+    let home = t.path().join("home");
+    fs::create_dir_all(&home).unwrap();
+    let text = String::from_utf8(run(&home, &["status", "42"]).stdout).unwrap();
+    assert!(text.contains("has no Shader Guard shader folder yet"));
+    assert!(!home.join(".local/share/steam-shader-guard").exists());
+
+    let game = home.join(".local/share/steam-shader-guard/games/42");
+    let old = game.join("nvidia/GLCache/old-driver/gpu");
+    let new = game.join("nvidia/GLCache/new-driver/gpu");
+    for dir in [&old, &new] {
+        fs::create_dir_all(dir).unwrap();
+    }
+    let toc = |keys: &[u8]| {
+        let mut toc = vec![0u8; 32];
+        for key in keys {
+            toc.extend([*key; 16]);
+            toc.extend([0u8; 8]);
+        }
+        toc
+    };
+    fs::write(old.join("sg_seed_0.toc"), toc(&[1, 2, 3])).unwrap();
+    fs::write(old.join("sg_seed_0.bin"), vec![0u8; 1000]).unwrap();
+    fs::write(old.join("shader_guard0.toc"), toc(&[3, 4])).unwrap();
+    fs::write(old.join("shader_guard0.bin"), vec![0u8; 500]).unwrap();
+    fs::write(game.join("readonly-names.txt"), "sg_seed_0;sg_gone_1\n").unwrap();
+    let text = String::from_utf8(run(&home, &["status", "42"]).stdout).unwrap();
+    assert!(text.contains("GLCache/old-driver/gpu (most recently used)"));
+    assert!(text.contains("GLCache/new-driver/gpu\n  Game's own cache: 0 entries"));
+    assert!(text.contains("Last game write: never."));
+    assert!(text.contains("compiled again although the copy had them: 1 of the game's 2 entries."));
+    assert!(text.contains("missing: sg_gone_1"));
+
+    // The game then runs with a new driver: the copied shaders stay behind.
+    std::thread::sleep(std::time::Duration::from_millis(20));
+    fs::write(new.join("shader_guard0.toc"), toc(&[1])).unwrap();
+    fs::write(new.join("shader_guard0.bin"), vec![0u8; 100]).unwrap();
+    let text = String::from_utf8(run(&home, &["status", "42"]).stdout).unwrap();
+    assert!(text.contains("GLCache/new-driver/gpu (most recently used)"));
+    assert!(text.contains("Older folders use"));
+    assert!(text.contains("the current driver does not read them"));
+    let report: serde_json::Value =
+        serde_json::from_slice(&run(&home, &["status", "42", "--json"]).stdout).unwrap();
+    assert_eq!(report["copied_files_in_most_recent_folder"], false);
+    assert_eq!(report["folders"][1]["recompiled_despite_copy"], 1);
+    assert!(report["folders"][0]["recompiled_despite_copy"].is_null());
+    assert_eq!(
+        report["bytes_in_older_folders"],
+        32 + 72 + 1000 + 32 + 48 + 500
+    );
+    assert!(!home.join(".local/state/steam-shader-guard").exists());
 }
 
 #[test]

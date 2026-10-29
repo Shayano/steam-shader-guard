@@ -111,6 +111,8 @@ You can also start it from a terminal:
 **Use this shortcut each time you start Steam.** Installation and game setup
 stay saved, but the shader pre-processing setting only applies to the Steam
 session started this way. Your usual Steam shortcut remains unchanged.
+If Steam starts automatically when you log in, that session does not use the
+shortcut. `doctor` points out such login entries and the command to use instead.
 
 Setting up a game without using the new Steam shortcut does not skip Steam's
 shader pre-processing. Using the shortcut without setting up the game does not
@@ -185,6 +187,21 @@ Launch options you add yourself must also be removed yourself before uninstallin
 
 </details>
 
+## After a driver or game update
+
+A game update keeps the game's Shader Guard cache. Shaders the update did not
+change are reused; new ones compile as you play, once.
+
+Each NVIDIA driver version uses a new folder inside the game's cache, so the first
+sessions after a driver update compile again, and copied shaders from the old
+driver are no longer read. To see the folders, their sizes and which one is in use:
+
+```sh
+~/.local/bin/steam-shader-guard status 2357570
+```
+
+Older folders can be deleted by hand once the game has run with the new driver.
+
 ## Stop using Shader Guard
 
 Fully exit Steam and any running games first.
@@ -215,6 +232,7 @@ Use a command followed by `--help` for its options, such as `enable --help`.
 | --- | --- |
 | `doctor` | Check Steam and list your installed games and their IDs. |
 | `scan GAME_ID` | Check existing shader files without changing them. |
+| `status GAME_ID` | Show the game's Shader Guard folders, per NVIDIA driver, without changing them. |
 | `recover GAME_ID --apply` | Make a checked, separate copy of reusable shaders. |
 | `install --apply` | Install the tool and the new Steam shortcut. |
 | `enable GAME_ID --apply` | Set up a game to use Shader Guard. |
@@ -311,6 +329,8 @@ Unset or empty values use the defaults above.
 `SHADER_GUARD_HOME` selects an isolated home for tests without changing `HOME`.
 The game launcher requests a 12 GB NVIDIA cache unless an existing setting
 specifies another value. This is not a limit on the total folder size.
+It also turns off the driver's cache cleanup (`__GL_SHADER_DISK_CACHE_SKIP_CLEANUP=1`,
+as Steam does for its own launches) unless an existing setting says otherwise.
 
 Interrupted copying does not save an incomplete destination.
 A forced stop can leave a hidden `.shader-guard-*` temporary folder beside the

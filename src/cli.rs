@@ -37,6 +37,12 @@ pub enum Command {
         #[arg(long)]
         apply: bool,
     },
+    /// Show a game's Shader Guard shader folders without changing them
+    #[command(
+        after_help = "Each folder belongs to one NVIDIA driver version and graphics card.\n\
+                      After a driver update, older folders are no longer read and can be removed by hand."
+    )]
+    Status(StatusOptions),
     /// Install the tool and add Steam (Shader Guard) to your application menu
     #[command(
         after_help = "This installs the tool only. It does not set up games, copy shaders or start Steam.\n\
@@ -119,6 +125,16 @@ pub struct CacheOptions {
     pub source: Option<PathBuf>,
     #[command(flatten)]
     pub steam: SteamOptions,
+    /// Show a JSON report instead of the readable summary (for scripts)
+    #[arg(long)]
+    pub json: bool,
+}
+
+#[derive(Args)]
+pub struct StatusOptions {
+    /// Game ID from doctor, for example 2357570
+    #[arg(value_name = "GAME_ID", value_parser = parse_id)]
+    pub id: String,
     /// Show a JSON report instead of the readable summary (for scripts)
     #[arg(long)]
     pub json: bool,

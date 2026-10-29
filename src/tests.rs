@@ -31,6 +31,7 @@ fn fake_paths(dir: &Path) -> Paths {
         home: dir.into(),
         data: dir.join("data/steam-shader-guard"),
         state: dir.join("state/steam-shader-guard"),
+        config: dir.join("config"),
         bin: dir.join("bin/steam-shader-guard"),
     }
 }
@@ -275,7 +276,12 @@ fn game_cache_is_isolated_and_explicit_overrides_survive() {
         p.app("42").join("nvidia").to_str().unwrap()
     );
     assert_eq!(out["__GL_SHADER_DISK_CACHE_SIZE"], "123456");
+    assert_eq!(out["__GL_SHADER_DISK_CACHE_SKIP_CLEANUP"], "1");
     assert!(!out.contains_key("__GL_SHADER_DISK_CACHE_READ_ONLY_APP_NAME"));
+    let mut kept = e.clone();
+    kept.insert("__GL_SHADER_DISK_CACHE_SKIP_CLEANUP".into(), "0".into());
+    let out = steam::game_environment(&p, "42", &kept).unwrap();
+    assert_eq!(out["__GL_SHADER_DISK_CACHE_SKIP_CLEANUP"], "0");
     let custom = BTreeMap::from([("__GL_SHADER_DISK_CACHE_PATH".into(), "/my/cache".into())]);
     assert_eq!(steam::game_environment(&p, "42", &custom).unwrap(), custom);
 }

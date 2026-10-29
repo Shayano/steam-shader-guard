@@ -180,11 +180,13 @@ pub fn doctor(paths: &Paths, args: &SteamOptions, json: bool) -> Result<()> {
             "recovered_seeds_present":private.join("readonly-names.txt").is_file()}));
     }
     let count = output.len();
+    let autostart = plain_steam_autostart(paths);
     if json {
         print_json(
             &serde_json::json!({"version":env!("CARGO_PKG_VERSION"),"steam_root":steam_root,
         "nvidia_driver_loaded":nvidia,
         "installed_launcher":installed,"applications":output,
+        "steam_autostart_without_shader_guard":autostart,
         "scope":"native Steam on Linux; Flatpak/Snap unsupported; no GPU performance tuning"}),
         )?;
     } else if count == 0 {
@@ -196,9 +198,273 @@ pub fn doctor(paths: &Paths, args: &SteamOptions, json: bool) -> Result<()> {
             println!("First, install the tool with install --apply.");
         }
     }
+    if !json {
+        for path in &autostart {
+            println!(
+                "\nSteam starts automatically at login through {}, without Shader Guard.\n\
+                 That Steam session keeps NVIDIA shader pre-processing on, even if you use the Steam (Shader Guard) shortcut later.\n\
+                 To change this, set that entry's command to: {} steam %U",
+                path.display(),
+                desktop_quote(&paths.bin)?
+            );
+        }
+    }
     progress(format_args!(
         "Check finished. Games found: {count}. No files changed."
     ));
+    Ok(())
+}
+
+/// Login autostart entries that start Steam directly instead of through this tool.
+fn plain_steam_autostart(paths: &Paths) -> Vec<PathBuf> {
+    let Ok(entries) = fs::read_dir(paths.config.join("autostart")) else {
+        return Vec::new();
+    };
+    let mut found = Vec::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().is_none_or(|e| e != "desktop") {
+            continue;
+        }
+        let Ok(text) = fs::read_to_string(&path) else {
+            continue;
+        };
+        // Only the main [Desktop Entry] group starts at login, not its actions.
+        let main = text.split("\n[").next().unwrap_or_default();
+        let disabled = main.lines().map(str::trim).any(|line| {
+            line.eq_ignore_ascii_case("Hidden=true")
+                || line.eq_ignore_ascii_case("X-GNOME-Autostart-enabled=false")
+        });
+        let starts_steam = main
+            .lines()
+            .filter_map(|line| line.trim().strip_prefix("Exec="))
+            .filter_map(|exec| exec.split_whitespace().next())
+            .any(|program| {
+                Path::new(program.trim_matches('"'))
+                    .file_name()
+                    .is_some_and(|name| name == "steam")
+            });
+        if starts_steam && !disabled {
+            found.push(path);
+        }
+    }
+    found.sort();
+    found
+}
+
+#[derive(Serialize)]
+struct CacheFolder {
+    folder: String,
+    most_recent: bool,
+    days_since_last_game_write: Option<u64>,
+    game_entries: u64,
+    game_bytes: u64,
+    copied_entries: u64,
+    copied_bytes: u64,
+    other_bytes: u64,
+    /// Keys the game compiled again although a copied file in this folder had them.
+    recompiled_despite_copy: Option<u64>,
+    #[serde(skip)]
+    game_tocs: Vec<PathBuf>,
+    #[serde(skip)]
+    copied_tocs: Vec<PathBuf>,
+}
+fn toc_keys(path: &Path) -> Result<BTreeSet<[u8; 16]>> {
+    let toc = fs::read(path)?;
+    Ok(toc
+        .get(32..)
+        .unwrap_or_default()
+        .chunks_exact(24)
+        .filter_map(|entry| entry[..16].try_into().ok())
+        .collect())
+}
+fn gigabytes(bytes: u64) -> String {
+    format!("{:.1} GB", bytes as f64 / 1e9)
+}
+pub fn status(paths: &Paths, id: &str, json: bool) -> Result<()> {
+    progress(format_args!(
+        "Checking Shader Guard's shader folders for game {id}. Nothing will be changed."
+    ));
+    let nvidia = paths.app(id).join("nvidia");
+    let names = paths.app(id).join("readonly-names.txt");
+    let seeds = match fs::read_to_string(&names) {
+        Ok(text) => text
+            .trim()
+            .split(';')
+            .filter(|n| !n.is_empty())
+            .map(String::from)
+            .collect::<BTreeSet<_>>(),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => BTreeSet::new(),
+        Err(e) => return Err(e.into()),
+    };
+    let now = std::time::SystemTime::now();
+    let mut folders = Vec::new();
+    let mut found_seeds = BTreeSet::new();
+    let mut newest = Vec::new();
+    // The NVIDIA driver keeps one GLCache/<driver>/<device> folder per driver and GPU.
+    let mut leaves = Vec::new();
+    if let Ok(drivers) = fs::read_dir(nvidia.join("GLCache")) {
+        for driver in drivers {
+            let driver = driver?;
+            if !driver.file_type()?.is_dir() {
+                continue;
+            }
+            for device in fs::read_dir(driver.path())? {
+                let device = device?;
+                if device.file_type()?.is_dir() {
+                    leaves.push(device.path());
+                }
+            }
+        }
+    }
+    leaves.sort();
+    for leaf in leaves {
+        let mut folder = CacheFolder {
+            folder: leaf.strip_prefix(&nvidia)?.to_string_lossy().into(),
+            most_recent: false,
+            days_since_last_game_write: None,
+            game_entries: 0,
+            game_bytes: 0,
+            copied_entries: 0,
+            copied_bytes: 0,
+            other_bytes: 0,
+            recompiled_despite_copy: None,
+            game_tocs: Vec::new(),
+            copied_tocs: Vec::new(),
+        };
+        let mut last = None;
+        for file in fs::read_dir(&leaf)? {
+            let file = file?;
+            let metadata = file.metadata()?;
+            if !metadata.is_file() {
+                continue;
+            }
+            let path = file.path();
+            let stem = path
+                .file_stem()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .into_owned();
+            let toc = path.extension().is_some_and(|e| e == "toc");
+            let entries = if toc {
+                metadata.len().saturating_sub(32) / 24
+            } else {
+                0
+            };
+            if seeds.contains(&stem) {
+                found_seeds.insert(stem);
+                folder.copied_bytes += metadata.len();
+                folder.copied_entries += entries;
+                if toc {
+                    folder.copied_tocs.push(path);
+                }
+            } else if stem.starts_with("shader_guard") {
+                last = last.max(Some(metadata.modified()?));
+                folder.game_bytes += metadata.len();
+                folder.game_entries += entries;
+                if toc {
+                    folder.game_tocs.push(path);
+                }
+            } else {
+                folder.other_bytes += metadata.len();
+            }
+        }
+        folder.days_since_last_game_write =
+            last.map(|t| now.duration_since(t).map_or(0, |d| d.as_secs() / 86400));
+        if !folder.copied_tocs.is_empty() && !folder.game_tocs.is_empty() {
+            // Only the index files are read: a few MB even for large caches.
+            let mut copied = BTreeSet::new();
+            for toc in &folder.copied_tocs {
+                copied.append(&mut toc_keys(toc)?);
+            }
+            let mut game = BTreeSet::new();
+            for toc in &folder.game_tocs {
+                game.append(&mut toc_keys(toc)?);
+            }
+            folder.recompiled_despite_copy = Some(game.intersection(&copied).count() as u64);
+        }
+        newest.push(last);
+        folders.push(folder);
+    }
+    // The folder the game wrote to last is the one its current driver uses.
+    if let Some(index) = newest
+        .iter()
+        .enumerate()
+        .filter(|(_, time)| time.is_some())
+        .max_by_key(|(_, time)| **time)
+        .map(|(i, _)| i)
+    {
+        folders[index].most_recent = true;
+    }
+    let missing = seeds.difference(&found_seeds).cloned().collect::<Vec<_>>();
+    let seeds_in_use = folders
+        .iter()
+        .any(|f| f.most_recent && f.copied_entries > 0);
+    let unused = folders
+        .iter()
+        .filter(|f| !f.most_recent)
+        .map(|f| f.game_bytes + f.copied_bytes + f.other_bytes)
+        .sum::<u64>();
+    if json {
+        print_json(
+            &serde_json::json!({"appid":id,"folder":nvidia,"folders":folders,
+            "copied_files_listed":seeds.len(),"copied_files_missing":missing,
+            "copied_files_in_most_recent_folder":seeds_in_use,"bytes_in_older_folders":unused}),
+        )?;
+    } else if folders.is_empty() {
+        println!(
+            "Game {id} has no Shader Guard shader folder yet. It is created the first time the game starts through Shader Guard."
+        );
+    } else {
+        println!(
+            "Shader Guard shader folders for game {id}: {}",
+            nvidia.display()
+        );
+        for f in &folders {
+            println!(
+                "{}{}\n  Game's own cache: {} entries, {}. Copied shaders: {} entries, {}. Last game write: {}.",
+                f.folder,
+                if f.most_recent {
+                    " (most recently used)"
+                } else {
+                    ""
+                },
+                f.game_entries,
+                gigabytes(f.game_bytes),
+                f.copied_entries,
+                gigabytes(f.copied_bytes),
+                f.days_since_last_game_write
+                    .map_or("never".into(), |days| format!("{days} days ago"))
+            );
+            if let Some(count) = f.recompiled_despite_copy {
+                println!(
+                    "  Shaders the game compiled again although the copy had them: {count} of the game's {} entries.",
+                    f.game_entries
+                );
+            }
+        }
+        if !folders.iter().any(|f| f.most_recent) {
+            println!("The game has not saved any shaders here yet.");
+        } else if folders.len() > 1 {
+            println!(
+                "Each folder belongs to one NVIDIA driver version and graphics card. The driver only reads the most recently used one.\n\
+                 Older folders use {}. After the game has run with your current driver, you can delete them by hand.",
+                gigabytes(unused)
+            );
+        }
+        if !seeds.is_empty() && !seeds_in_use && folders.iter().any(|f| f.most_recent) {
+            println!(
+                "The copied shaders are not in the most recently used folder, so the current driver does not read them."
+            );
+        }
+        if !missing.is_empty() {
+            println!(
+                "Some copied shader files listed for this game are missing: {}.",
+                missing.join(", ")
+            );
+        }
+    }
+    progress("Check finished. No files changed.");
     Ok(())
 }
 
@@ -665,6 +931,9 @@ pub fn game_environment(
     fs::create_dir_all(&directory)?;
     out.entry("__GL_SHADER_DISK_CACHE_SIZE".into())
         .or_insert("12000000000".into());
+    // Steam sets this for its own launches; keep it if Steam stops doing so.
+    out.entry("__GL_SHADER_DISK_CACHE_SKIP_CLEANUP".into())
+        .or_insert("1".into());
     out.insert(
         "__GL_SHADER_DISK_CACHE_PATH".into(),
         directory
@@ -711,6 +980,7 @@ pub fn run_game(paths: &Paths, args: Vec<OsString>) -> Result<()> {
     let selected = [
         "__GL_SHADER_DISK_CACHE_PATH",
         "__GL_SHADER_DISK_CACHE_SIZE",
+        "__GL_SHADER_DISK_CACHE_SKIP_CLEANUP",
         "__GL_SHADER_DISK_CACHE_APP_NAME",
         "__GL_SHADER_DISK_CACHE_READ_ONLY_APP_NAME",
     ];
